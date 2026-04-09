@@ -1,0 +1,28 @@
+from google import genai
+import os
+
+API_KEY = "AIzaSyA_XYEegNjydD2WDh36-0Ydh8RuFBSb068"
+client = genai.Client(api_key=API_KEY)
+
+
+def start_chat():
+    print("--- Чат-бот на Gemini активовано! (напишіть 'вихід' для завершення) ---")
+
+    # Створюємо сесію чату для збереження історії
+    chat = client.chats.create(model="gemini-2.5-flash")
+
+    while True:
+        user_input = input("Ви: ")
+        if user_input.lower() in ["вихід", "exit", "quit"]:
+            break
+
+        try:
+            # Надсилаємо повідомлення
+            response = chat.send_message(user_input)
+            print(f"Gemini: {response.text}")
+        except Exception as e:
+            print(f"Сталася помилка: {e}")
+
+
+if __name__ == "__main__":
+    start_chat()
