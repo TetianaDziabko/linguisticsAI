@@ -1,0 +1,91 @@
+import gradio as gr
+from gtts import gTTS
+import uuid
+import random
+import os
+
+# Приклади текстів для швидкої перевірки
+UA_EXAMPLES = [
+    "Технології синтезу мовлення дозволяють нам спілкуватися з машинами природною мовою.",
+    "Сьогодні комп'ютери не просто обробляють дані, вони починають звучати як люди.",
+    "Цей додаток створено в рамках лабораторної роботи з інтелектуальної лінгвістики."
+]
+
+EN_EXAMPLES = [
+    "Text to speech technology is a bridge between humans and artificial intelligence.",
+    "Welcome to the future where every written word can have its own voice.",
+    "This is a demonstration of speech generation using Python and Google TTS."
+]
+
+def generate_audio(text, language, slow, history):
+    if not text or text.strip() == "":
+        return None, history, "Будь ласка, введіть текст!"
+
+    # Визначаємо код мови
+    lang_code = "uk" if language == "Українська" else "en"
+
+    # Створюємо унікальне ім'я файлу, щоб вони не перезаписували один одного
+    file_name = f"speech_{uuid.uuid4().hex[:8]}.mp3"
+    
+    # Генерація мовлення через gTTS
+    tts = gTTS(text=text.strip(), lang=lang_code, slow=slow)
+    tts.save(file_name)
+
+    history = history or []
+    history = [file_name] + history
+    history = history[:5]
+
+    return file_name, history, "Аудіо успішно згенеровано!"
+
+def get_random_example(language):
+    return random.choice(UA_EXAMPLES if language == "Українська" else EN_EXAMPLES)
+
+# Створення інтерфейсу за допомогою Gradio Blocks
+with gr.Blocks(title="ЛР №4: Синтез мовлення", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("#Лабораторна робота №4: Генерування мовлення")
+    gr.Markdown("Введіть текст нижче, щоб перетворити його на аудіо-файл MP3.")
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            # Поле для введення тексту
+            text_input = gr.Textbox(
+                label="Ваш текст", 
+                placeholder="Введіть щось цікаве...", 
+                lines=8
+            )
+            
+            # Налаштування
+            with gr.Row():
+                lang_radio = gr.Radio(["Українська", "Англійська"], value="Українська", label="Мова")
+                slow_check = gr.Checkbox(label="Уповільнити мовлення", value=False)
+            
+            # Кнопки керування
+            with gr.Row():
+                example_btn = gr.Button("🎲 Випадковий приклад")
+                generate_btn = gr.Button("🚀 Згенерувати звук", variant="primary")
+            
+            status_msg = gr.Markdown("")
+
+        with gr.Column(scale=1):
+            # Результат
+            audio_out = gr.Audio(label="Прослухати результат", type="filepath")
+            
+            # Історія файлів
+            history_state = gr.State([])
+            history_display = gr.Files(label="Історія (останні 5 файлів)", interactive=False)
+
+    # Логіка кнопок
+    example_btn.click(fn=get_random_example, inputs=lang_radio, outputs=text_input)
+    
+    generate_btn.click(
+        fn=generate_audio, 
+        inputs=[text_input, lang_radio, slow_check, history_state], 
+        outputs=[audio_out, history_state, status_msg]
+    ).then(
+        fn=lambda h: h, 
+        inputs=history_state, 
+        outputs=history_display
+    )
+
+if __name__ == "__main__":
+    demo.launch(share=True)
