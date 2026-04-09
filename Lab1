@@ -1,0 +1,702 @@
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from PIL import Image
+
+# ============================================================
+# 1. НАЛАШТУВАННЯ
+# ============================================================
+
+BASE_DATASET_PATH = "iam_words"
+WORDS_TXT_PATH = os.path.join(BASE_DATASET_PATH, "words.txt")
+WORDS_FOLDER_PATH = os.path.join(BASE_DATASET_PATH, "words")
+
+# Розміри зображення
+IMG_WIDTH = 256
+IMG_HEIGHT = 32
+
+# Параметри навчання
+BATCH_SIZE = 16
+EPOCHS = 40
+MAX_SAMPLES = None
+
+# Розбиття:
+# 80% train, 10% validation, 10% test
+TRAIN_RATIO = 0.80
+
+# ============================================================
+# 2. ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ ЗЧИТУВАННЯ ДАНИХ
+# ============================================================
+
+def get_image_path(words_folder: str, image_id: str) -> str:
+    """
+    Формує шлях до png-файлу за image_id.
+    Наприклад:
+    a01-000u-00-00 -> words/a01/a01-000u/a01-000u-00-00.png
+    """
+    parts = image_id.split("-")
+    folder1 = parts[0]
+    folder2 = f"{parts[0]}-{parts[1]}"
+    return os.path.join(words_folder, folder1, folder2, image_id + ".png")
+
+
+def is_valid_image(image_path: str) -> bool:
+    """
+    Перевіряє, чи файл:
+    - існує,
+    - не порожній,
+    - відкривається як зображення.
+    """
+    try:
+        if not os.path.exists(image_path):
+            return False
+
+        if os.path.getsize(image_path) == 0:
+            return False
+
+        with Image.open(image_path) as img:
+            img.verify()
+
+        return True
+    except Exception:
+        return False
+
+
+def load_iam_words(words_txt_path: str, words_folder: str, max_samples=None):
+    """
+    Зчитує words.txt, бере лише записи зі статусом 'ok',
+    перевіряє зображення і повертає:
+    image_paths, labels
+    """
+    image_paths = []
+    labels = []
+    skipped = 0
+
+    with open(words_txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split()
+
+            if len(parts) < 9:
+                skipped += 1
+                continue
+
+            image_id = parts[0]
+            status = parts[1]
+
+            if status != "ok":
+                continue
+
+            label = " ".join(parts[8:])
+            image_path = get_image_path(words_folder, image_id)
+
+            if is_valid_image(image_path):
+                image_paths.append(image_path)
+                labels.append(label)
+            else:
+                skipped += 1
+
+            if max_samples is not None and len(image_paths) >= max_samples:
+                break
+
+    print(f"Коректних зображень: {len(image_paths)}")
+    print(f"Пропущено пошкоджених/порожніх файлів: {skipped}")
+
+    return image_paths, labels
+
+
+print("Зчитування датасету...")
+image_paths, labels = load_iam_words(
+    WORDS_TXT_PATH,
+    WORDS_FOLDER_PATH,
+    max_samples=MAX_SAMPLES
+)
+
+labels = [l.lower() for l in labels]
+
+if len(image_paths) == 0:
+    raise ValueError("Не знайдено жодного коректного зображення. Перевір шляхи до датасету.")
+
+print(f"Усього завантажено прикладів: {len(image_paths)}")
+
+# ============================================================
+# 3. СЛОВНИК СИМВОЛІВ
+# ============================================================
+
+characters = sorted(set(char for label in labels for char in label))
+print("Кількість унікальних символів:", len(characters))
+print("Символи:", characters)
+
+char_to_num = layers.StringLookup(vocabulary=characters, mask_token=None)
+num_to_char = layers.StringLookup(
+    vocabulary=char_to_num.get_vocabulary(),
+    mask_token=None,
+    invert=True
+)
+
+max_label_length = max(len(label) for label in labels)
+print("Максимальна довжина слова:", max_label_length)
+
+# ============================================================
+# 4. ПОДІЛ НА TRAIN / VALIDATION / TEST
+# ============================================================
+
+train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+    image_paths,
+    labels,
+    test_size=(1.0 - TRAIN_RATIO),
+    random_state=42,
+    shuffle=True
+)
+
+val_paths, test_paths, val_labels, test_labels = train_test_split(
+    temp_paths,
+    temp_labels,
+    test_size=0.50,                  
+    random_state=42,
+    shuffle=True
+)
+
+print(f"Train: {len(train_paths)}")
+print(f"Validation: {len(val_paths)}")
+print(f"Test: {len(test_paths)}")
+
+# ============================================================
+# 5. ПОПЕРЕДНЯ ОБРОБКА ЗОБРАЖЕНЬ
+# ============================================================
+
+def distortion_free_resize(image, img_size=(IMG_WIDTH, IMG_HEIGHT)):
+    """
+    Масштабування із збереженням пропорцій + padding.
+    Padding робимо білим, бо в IAM світлий фон.
+    """
+    w, h = img_size
+
+    image = tf.image.resize(image, size=(h, w), preserve_aspect_ratio=True)
+
+    pad_height = h - tf.shape(image)[0]
+    pad_width = w - tf.shape(image)[1]
+
+    pad_top = pad_height // 2
+    pad_bottom = pad_height - pad_top
+    pad_left = pad_width // 2
+    pad_right = pad_width - pad_left
+
+    image = tf.pad(
+        image,
+        paddings=[
+            [pad_top, pad_bottom],
+            [pad_left, pad_right],
+            [0, 0]
+        ],
+        constant_values=1.0   # білий фон замість чорного
+    )
+
+    return image
+
+def crop_word_region(image_tensor):
+    """
+    Обрізає зайві поля навколо слова.
+    Працює для зображень типу: темний текст на світлому фоні.
+    """
+    # image_tensor: [H, W, 1], float32, значення 0..1
+    img = tf.squeeze(image_tensor, axis=-1)  # [H, W]
+
+    # Шукаємо "темні" пікселі як текст
+    mask = img < 0.8
+
+    coords = tf.where(mask)
+
+    # Якщо текст не знайдено — повертаємо як є
+    if tf.shape(coords)[0] == 0:
+        return image_tensor
+
+    y_min = tf.reduce_min(coords[:, 0])
+    y_max = tf.reduce_max(coords[:, 0])
+    x_min = tf.reduce_min(coords[:, 1])
+    x_max = tf.reduce_max(coords[:, 1])
+
+    cropped = image_tensor[y_min:y_max + 1, x_min:x_max + 1, :]
+    return cropped
+
+def encode_single_sample(img_path, label):
+    """
+    Читає зображення, обрізає зайві поля, нормалізує,
+    змінює розмір і кодує текстову мітку.
+    """
+    img = tf.io.read_file(img_path)
+    img = tf.io.decode_image(img, channels=1, expand_animations=False)
+    img.set_shape([None, None, 1])
+
+    img = tf.image.convert_image_dtype(img, tf.float32)
+
+    # Обрізання зайвих полів
+    img = crop_word_region(img)
+
+    # Resize + padding
+    img = distortion_free_resize(img, img_size=(IMG_WIDTH, IMG_HEIGHT))
+
+    # Для OCR ширина = часова вісь
+    img = tf.transpose(img, perm=[1, 0, 2])
+
+    label = tf.strings.unicode_split(label, input_encoding="UTF-8")
+    label = char_to_num(label)
+
+    return {"image": img, "label": label}
+
+def prepare_dataset(image_paths, labels):
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, labels))
+    dataset = dataset.map(encode_single_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.padded_batch(BATCH_SIZE)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
+train_ds = prepare_dataset(train_paths, train_labels)
+val_ds = prepare_dataset(val_paths, val_labels)
+test_ds = prepare_dataset(test_paths, test_labels)
+
+# ============================================================
+# 6. CTC ШАР
+# ============================================================
+
+class CTCLayer(layers.Layer):
+    """
+    Шар для обчислення CTC-loss.
+    Реальна довжина міток рахується без паддінгу.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.loss_fn = keras.backend.ctc_batch_cost
+
+    def call(self, y_true, y_pred):
+        batch_len = tf.cast(tf.shape(y_true)[0], dtype="int64")
+        input_length = tf.cast(tf.shape(y_pred)[1], dtype="int64")
+
+        # Реальна довжина міток: рахуємо кількість непорожніх токенів
+        # Паддінг у StringLookup + padded_batch заповнюється нулями
+        label_length = tf.math.count_nonzero(y_true, axis=1, keepdims=True, dtype="int64")
+
+        input_length = input_length * tf.ones(shape=(batch_len, 1), dtype="int64")
+
+        loss = self.loss_fn(y_true, y_pred, input_length, label_length)
+        self.add_loss(loss)
+
+        return y_pred
+
+# ============================================================
+# 7. ПОБУДОВА OCR-МОДЕЛІ
+# ============================================================
+
+def build_model():
+    input_img = layers.Input(
+        shape=(IMG_WIDTH, IMG_HEIGHT, 1),
+        name="image",
+        dtype="float32"
+    )
+
+    labels_input = layers.Input(
+        name="label",
+        shape=(None,),
+        dtype="int64"
+    )
+
+    # CNN
+    x = layers.Conv2D(64, (3, 3), activation="relu", padding="same")(input_img)
+    x = layers.MaxPooling2D((2, 2))(x)
+
+    x = layers.Conv2D(128, (3, 3), activation="relu", padding="same")(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+
+    # Перехід до послідовності
+    new_shape = (IMG_WIDTH // 4, (IMG_HEIGHT // 4) * 128)
+    x = layers.Reshape(target_shape=new_shape)(x)
+
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+
+    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
+    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
+
+    x = layers.Dense(
+        len(char_to_num.get_vocabulary()) + 1,
+        activation="softmax",
+        name="dense2"
+    )(x)
+
+    output = CTCLayer(name="ctc_loss")(labels_input, x)
+
+    model = keras.models.Model(
+        inputs=[input_img, labels_input],
+        outputs=output,
+        name="iam_word_ocr_model"
+    )
+
+    optimizer = keras.optimizers.Adam(learning_rate=0.0003)
+    model.compile(optimizer=optimizer)
+    return model
+
+
+#model = build_model()
+#model.summary()
+model = keras.models.load_model(
+    "best_iam_word_ocr.keras",
+    custom_objects={"CTCLayer": CTCLayer}
+)
+
+model.summary()
+
+# ============================================================
+# 8. НАВЧАННЯ
+# ============================================================
+
+early_stopping = keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=2,
+    restore_best_weights=True
+)
+
+reduce_lr = keras.callbacks.ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.5,
+    patience=2,
+    min_lr=1e-6
+)
+
+checkpoint = keras.callbacks.ModelCheckpoint(
+    "best_iam_word_ocr.keras",
+    monitor="val_loss",
+    save_best_only=True,
+    mode="min"
+)
+
+#history = model.fit(
+ #   train_ds,
+  #  validation_data=val_ds,
+   # epochs=EPOCHS,
+    #callbacks=[early_stopping, checkpoint, reduce_lr]
+#)
+
+# ============================================================
+# 9. МОДЕЛЬ ДЛЯ ПЕРЕДБАЧЕННЯ
+# ============================================================
+
+prediction_model = keras.models.Model(
+    inputs=model.inputs[0],
+    outputs=model.get_layer(name="dense2").output
+)
+
+# ============================================================
+# 10. ДЕКОДУВАННЯ ПЕРЕДБАЧЕНЬ
+# ============================================================
+
+def decode_batch_predictions(pred):
+    """
+    Перетворює вихід моделі у текст і прибирає [UNK].
+    """
+    input_len = np.ones(pred.shape[0]) * pred.shape[1]
+
+    results = keras.backend.ctc_decode(
+        pred,
+        input_length=input_len,
+        greedy=False,
+        beam_width=10
+    )[0][0]
+
+    output_text = []
+
+    for res in results:
+        res = tf.gather(res, tf.where(res != -1))
+        res = tf.squeeze(res, axis=1)
+
+        chars = num_to_char(res)
+        text = tf.strings.reduce_join(chars).numpy().decode("utf-8")
+
+        # прибираємо службовий токен
+        text = text.replace("[UNK]", "")
+        output_text.append(text)
+
+    return output_text
+
+def char_accuracy(true_list, pred_list):
+    """
+    Обчислює посимвольну точність з вирівнюванням довжин.
+    """
+    total_chars = 0
+    correct_chars = 0
+
+    for true_word, pred_word in zip(true_list, pred_list):
+        max_len = max(len(true_word), len(pred_word))
+        total_chars += max_len
+
+        true_padded = list(true_word) + [""] * (max_len - len(true_word))
+        pred_padded = list(pred_word) + [""] * (max_len - len(pred_word))
+
+        for tc, pc in zip(true_padded, pred_padded):
+            if tc == pc:
+                correct_chars += 1
+
+    if total_chars == 0:
+        return 0.0
+
+    return correct_chars / total_chars
+
+# ============================================================
+# 11. ОЦІНЮВАННЯ НА TEST
+# ============================================================
+
+all_preds = []
+all_true = []
+
+for batch in test_ds:
+    batch_images = batch["image"]
+    batch_labels = batch["label"]
+
+    preds = prediction_model.predict(batch_images, verbose=0)
+    pred_texts = decode_batch_predictions(preds)
+    all_preds.extend(pred_texts)
+
+    for lbl in batch_labels:
+        lbl = tf.gather(lbl, tf.where(lbl != 0))
+        lbl = tf.squeeze(lbl, axis=1)
+
+        true_text = tf.strings.reduce_join(num_to_char(lbl)).numpy().decode("utf-8")
+        all_true.append(true_text)
+
+correct_words = sum(p == t for p, t in zip(all_preds, all_true))
+word_accuracy = correct_words / len(all_true)
+character_accuracy = char_accuracy(all_true, all_preds)
+
+print(f"\nТочність на тестовій множині (word accuracy): {word_accuracy:.4f}")
+print(f"Точність на тестовій множині (char accuracy): {character_accuracy:.4f}")
+
+print("\nПриклади передбачень:")
+for i in range(min(15, len(all_true))):
+    print(f"True: {all_true[i]:15s} | Pred: {all_preds[i]}")
+
+# ============================================================
+# 12. ГРАФІКИ НАВЧАННЯ
+# ============================================================
+"""
+plt.figure(figsize=(8, 5))
+plt.plot(history.history["loss"], label="train_loss")
+plt.plot(history.history["val_loss"], label="val_loss")
+plt.title("Графік функції втрат")
+plt.xlabel("Епоха")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+"""
+# ============================================================
+# 13. ПЕРЕДБАЧЕННЯ ДЛЯ ОДНОГО ЗОБРАЖЕННЯ
+# ============================================================
+
+def predict_single_image(image_path):
+    """
+    Передбачення для одного зображення слова.
+    """
+    if not is_valid_image(image_path):
+        raise ValueError(f"Некоректне або пошкоджене зображення: {image_path}")
+
+    img = tf.io.read_file(image_path)
+    img = tf.io.decode_image(img, channels=1, expand_animations=False)
+    img.set_shape([None, None, 1])
+
+    img = tf.image.convert_image_dtype(img, tf.float32)
+
+    # Обрізаємо слово
+    img = crop_word_region(img)
+
+    # Resize + padding
+    img = distortion_free_resize(img, img_size=(IMG_WIDTH, IMG_HEIGHT))
+
+    # Транспонування
+    img = tf.transpose(img, perm=[1, 0, 2])
+
+    img = tf.expand_dims(img, axis=0)
+
+    pred = prediction_model.predict(img, verbose=0)
+    pred_text = decode_batch_predictions(pred)[0]
+
+    return pred_text
+
+# ============================================================
+# 14. ВІЗУАЛІЗАЦІЯ
+# ============================================================
+
+def show_image(image_path, title="Зображення"):
+    """
+    Показує оригінальне зображення.
+    """
+    img = Image.open(image_path).convert("L")
+    plt.figure(figsize=(8, 3))
+    plt.imshow(img, cmap="gray")
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+
+def preprocess_image_for_display(image_path):
+    """
+    Повертає оброблене зображення у вигляді numpy-масиву,
+    щоб показати, що саме бачить модель.
+    """
+    img = tf.io.read_file(image_path)
+    img = tf.io.decode_image(img, channels=1, expand_animations=False)
+    img.set_shape([None, None, 1])
+
+    img = tf.image.convert_image_dtype(img, tf.float32)
+
+    # Обрізаємо слово
+    img = crop_word_region(img)
+
+    # Resize + padding
+    img = distortion_free_resize(img, img_size=(IMG_WIDTH, IMG_HEIGHT))
+
+    # Транспонування
+    img = tf.transpose(img, perm=[1, 0, 2])
+
+    return img.numpy().squeeze()
+
+def show_original_and_processed(image_path):
+    """
+    Показує оригінальне та оброблене зображення поруч.
+    """
+    original = Image.open(image_path).convert("L")
+    processed = preprocess_image_for_display(image_path)
+
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.imshow(original, cmap="gray")
+    plt.title("Оригінальне зображення")
+    plt.axis("off")
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(processed, cmap="gray")
+    plt.title("Після попередньої обробки")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def predict_and_show(image_path):
+    """
+    Показує зображення і прогноз моделі.
+    """
+    if not is_valid_image(image_path):
+        raise ValueError(f"Некоректне або пошкоджене зображення: {image_path}")
+
+    prediction = predict_single_image(image_path)
+
+    show_original_and_processed(image_path)
+    print(f"Прогноз моделі: {prediction}")
+
+
+def show_test_predictions(num_samples=5):
+    """
+    Показує кілька прикладів із тестової вибірки:
+    зображення, правильне слово і прогноз моделі.
+    """
+    num_samples = min(num_samples, len(test_paths))
+
+    plt.figure(figsize=(12, num_samples * 2.5))
+
+    for i in range(num_samples):
+        image_path = test_paths[i]
+        true_label = test_labels[i]
+        pred_label = predict_single_image(image_path)
+
+        img = Image.open(image_path).convert("L")
+
+        plt.subplot(num_samples, 1, i + 1)
+        plt.imshow(img, cmap="gray")
+        plt.title(f"True: {true_label} | Pred: {pred_label}")
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 15. ПОКАЗ ТЕСТОВИХ ПРИКЛАДІВ
+# ============================================================
+
+print("\nПоказ кількох тестових прикладів:")
+show_test_predictions(num_samples=6)
+
+# ============================================================
+# 16. РОЗПІЗНАВАННЯ ВЛАСНОГО ЗОБРАЖЕННЯ
+# ============================================================
+
+user_path = input("\nВведіть шлях до вашого зображення (або Enter щоб пропустити): ")
+
+if user_path.strip() != "":
+    try:
+        predict_and_show(user_path)
+    except Exception as e:
+        print("Помилка:", e)
+
+# ============================================================
+# 17. GUI ДЛЯ ВИБОРУ ЗОБРАЖЕННЯ
+# ============================================================
+
+import tkinter as tk
+from tkinter import filedialog
+from PIL import ImageTk
+
+def open_file_and_predict():
+    file_path = filedialog.askopenfilename(
+        title="Виберіть зображення",
+        filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp")]
+    )
+
+    if not file_path:
+        return
+
+    try:
+        # прогноз
+        prediction = predict_single_image(file_path)
+
+        # показ картинки
+        img = Image.open(file_path).convert("L")
+        img = img.resize((300, 100))
+        img_tk = ImageTk.PhotoImage(img)
+
+        image_label.config(image=img_tk)
+        image_label.image = img_tk
+
+        # показ тексту
+        result_label.config(text=f"Прогноз: {prediction}")
+
+    except Exception as e:
+        result_label.config(text=f"Помилка: {e}")
+
+
+# створення вікна
+root = tk.Tk()
+root.title("OCR розпізнавання слова")
+root.geometry("400x300")
+
+# кнопка
+btn = tk.Button(root, text="Вибрати зображення", command=open_file_and_predict)
+btn.pack(pady=10)
+
+# місце для картинки
+image_label = tk.Label(root)
+image_label.pack()
+
+# результат
+result_label = tk.Label(root, text="Тут буде результат", font=("Arial", 14))
+result_label.pack(pady=10)
+
+root.mainloop()
