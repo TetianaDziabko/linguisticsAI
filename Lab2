@@ -1,0 +1,164 @@
+import os, asyncio, numpy as np, librosa, soundfile as sf, tensorflow as tf, time
+from gtts import gTTS
+from tensorflow.keras import layers, models
+from sklearn.preprocessing import LabelEncoder
+import tkinter as tk
+from tkinter import filedialog
+from pygame import mixer
+
+NATO_MAP = {
+    "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D", "echo": "E",
+    "foxtrot": "F", "golf": "G", "hotel": "H", "india": "I", "juliett": "J",
+    "kilo": "K", "lima": "L", "mike": "M", "november": "N", "oscar": "O",
+    "papa": "P", "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T",
+    "uniform": "U", "victor": "V", "whiskey": "W", "xray": "X", "yankee": "Y", "zulu": "Z",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+}
+CLASSES = sorted(list(NATO_MAP.keys())) 
+DATASET_DIR, MODEL_PATH, SR, DURATION = "dataset_aviation", "aviation_model.keras", 22050, 1.0
+
+mixer.init()
+
+def process_audio_chunk(y):
+    # Видаляємо тишу
+    y_trimmed, _ = librosa.effects.trim(y, top_db=20)
+    
+    # Робимо фіксовану довжину 1 сек
+    target_len = int(SR * DURATION)
+    if len(y_trimmed) > target_len:
+        y_trimmed = y_trimmed[:target_len]
+    
+    # Центруємо звук у вікні
+    padded = np.zeros(target_len)
+    start_idx = (target_len - len(y_trimmed)) // 2
+    padded[start_idx:start_idx + len(y_trimmed)] = y_trimmed
+    
+    # Нормалізуємо гучність
+    if np.max(np.abs(padded)) > 0:
+        padded = padded / np.max(np.abs(padded))
+    return padded
+
+def extract_features(y, augment=False):
+    y_proc = process_audio_chunk(y)
+    if augment:
+        # Аугментація: додавання гауссового шуму для підвищення стійкості моделі
+        y_proc += 0.003 * np.random.randn(len(y_proc))
+    
+    mfcc = librosa.feature.mfcc(y=y_proc, sr=SR, n_mfcc=40)
+    return mfcc[..., np.newaxis]
+
+def generate_dataset():
+    if not os.path.exists(DATASET_DIR):
+        os.makedirs(DATASET_DIR)
+        print("Генерація бази еталонів gTTS...")
+        for word in CLASSES:
+            tts = gTTS(text=word, lang='en')
+            tts.save("temp.mp3")
+            y, _ = librosa.load("temp.mp3", sr=SR)
+            word_dir = os.path.join(DATASET_DIR, word)
+            os.makedirs(word_dir, exist_ok=True)
+            sf.write(os.path.join(word_dir, "base.wav"), y, SR)
+            os.remove("temp.mp3")
+    print("База готова!")
+
+async def main():
+    generate_dataset()
+    le = LabelEncoder().fit(CLASSES) # Кодування назв слів у числові мітки
+    
+    if not os.path.exists(MODEL_PATH):
+        print("Навчання моделі..."); X, y_labels = [], []
+        for idx, word in enumerate(CLASSES):
+            path = os.path.join(DATASET_DIR, word, "base.wav")
+            y_base, _ = librosa.load(path, sr=SR)
+            for _ in range(70): # Створюємо 70 варіацій кожного слова
+                X.append(extract_features(y_base, augment=True))
+                y_labels.append(idx)
+        X, y_labels = np.array(X), np.array(y_labels)
+        
+        model = models.Sequential([
+            layers.Input(shape=X[0].shape),
+            layers.Conv2D(32, (3, 3), activation='relu'),
+            layers.MaxPooling2D((2, 2)),
+            layers.Conv2D(64, (3, 3), activation='relu'),
+            layers.MaxPooling2D((2, 2)),
+            layers.Flatten(),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(len(CLASSES), activation='softmax')
+        ])
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        model.fit(X, y_labels, epochs=15, batch_size=32, verbose=1)
+        model.save(MODEL_PATH)
+        print("Модель збережена!")
+    else:
+        model = tf.keras.models.load_model(MODEL_PATH)
+        print("Модель завантажена.")
+
+    while True:
+        print("\n--- МЕНЮ ---")
+        print("1. Аналізувати файл")
+        print("2. Тест")
+        print("3. Вихід")
+        cmd = input(" Дія: ")
+
+        if cmd == "1":
+            root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+            file_path = filedialog.askopenfilename(filetypes=[("Audio", "*.wav *.mp3")])
+            root.destroy()
+            
+            if file_path:
+                print(f"Аналіз: {os.path.basename(file_path)}")
+                y_all, _ = librosa.load(file_path, sr=SR)
+                
+                # Сегментація
+                intervals = librosa.effects.split(y_all, top_db=25, frame_length=2048, hop_length=512)
+                if len(intervals) == 0: intervals = np.array([[0, len(y_all)]])
+                
+                res_code = ""
+                for i, (s, e) in enumerate(intervals):
+                    chunk = y_all[s:e]
+                    
+                    # Передбачення класу для кожного знайденого сегмента
+                    feat = extract_features(chunk)[np.newaxis, ...]
+                    preds = model.predict(feat, verbose=0)
+                    word = le.inverse_transform([np.argmax(preds)])[0]
+                    char = NATO_MAP[word]
+                    res_code += char
+                    
+                    print(f"[{i+1}] Розпізнано: {word.upper()} ({char})")
+                    
+                    # Тимчасове відтворення сегмента
+                    t_name = f"tmp_seg_{i}.wav"
+                    sf.write(t_name, chunk, SR)
+                    try:
+                        mixer.music.load(t_name)
+                        mixer.music.play()
+                        while mixer.music.get_busy(): time.sleep(0.05)
+                        mixer.music.unload()
+                        os.remove(t_name)
+                    except: pass
+                
+                print(f"\n ПІДСУМОК: {res_code}")
+
+        elif cmd == "2":
+            print("\n--- ЗАПУСК ТЕСТУ ---")
+            test_res = ""
+            for word in ["november", "four", "five", "charlie", "nine"]:
+                path = os.path.join(DATASET_DIR, word, "base.wav")
+                y, _ = librosa.load(path, sr=SR)
+                
+                feat = extract_features(y)[np.newaxis, ...]
+                p = model.predict(feat, verbose=0)
+                pw = le.inverse_transform([np.argmax(p)])[0]
+                test_res += NATO_MAP[pw]
+                print(f"Озвучка: {word.upper()} -> Модель: {pw.upper()}")
+                
+                mixer.music.load(path)
+                mixer.music.play()
+                while mixer.music.get_busy(): time.sleep(0.05)
+            print(f" РЕЗУЛЬТАТ ТЕСТУ: {test_res}")
+
+        elif cmd == "3": break
+
+if __name__ == "__main__":
+    asyncio.run(main())
